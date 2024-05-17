@@ -3,14 +3,14 @@ package mr
 import (
 	"encoding/json"
 	"fmt"
-	"hash/fnv"
 	"io"
 	"log"
-	"net/rpc"
 	"os"
 	"sort"
 	"strconv"
-	"time"
+
+	"hash/fnv"
+	"net/rpc"
 )
 
 // Map functions return a slice of KeyValue.
@@ -27,6 +27,7 @@ func ihash(key string) int {
 	return int(h.Sum32() & 0x7fffffff)
 }
 
+// for sorting by key.
 type ByKey []KeyValue
 
 // for sorting by key.
@@ -38,94 +39,89 @@ func (a ByKey) Less(i, j int) bool { return a[i].Key < a[j].Key }
 func Worker(mapf func(string, string) []KeyValue,
 	reducef func(string, []string) string) {
 
+	rargs := RegisterArgs{}
+	rreply := RegisterReply{}
+
+	ok := call("Coordinator.RegisterWorker", &rargs, &rreply)
+	if !ok {
+		log.Fatal("InWorker error!")
+	}
+	workerId := rreply.Workerid
+
 	// Your worker implementation here.
+	for {
+		args := GetTaskArgs{Workerid: workerId}
+		reply := GetTaskReply{}
+
+		//this will wait until we get assigned a task
+		ok := call("Coordinator.HandleGetTask", &args, &reply)
+		if !ok {
+			log.Fatal("HandleGetTask error!")
+		}
+		fmt.Println("reply.TaskType", reply.TaskType)
+
+		switch reply.TaskType {
+		case Map:
+			performMap(reply.MapFile, reply.TaskNum, reply.NReduceTasks, mapf)
+		case Reduce:
+			performReduce(reply.TaskNum, reply.NMapTasks, reducef)
+		case Done:
+			os.Exit(0)
+		default:
+			fmt.Errorf("Bad task type? %s", reply.TaskType)
+		}
+
+		finArgs := &FinishedTaskArgs{
+			Workid:   workerId,
+			Tasktype: reply.TaskType,
+			TaskNum:  reply.TaskNum,
+		}
+		finReply := &FinishedTaskReply{}
+		ok = call("Coordinator.HandleFinishedTask", finArgs, finReply)
+		if !ok {
+			log.Fatal("HandleFinishedTask error!")
+		}
+	}
 
 	// uncomment to send the Example RPC to the coordinator.
 	// CallExample()
-	alive := true
-	for alive {
-		task := GetTask()
-		switch task.TaskType {
-		case MapTask:
-			{
-				DoMapTask(&task, mapf)
-				TaskDone(&task)
-			}
-		case WaitingTask:
-			{
-				fmt.Println("All tasks are in progress , Worker wait")
-				time.Sleep(time.Second)
-			}
-		case ReduceTask:
-			{
-				DoReduceTask(&task, reducef)
-				TaskDone(&task)
-			}
-		case ExitTask:
-			{
-				fmt.Println("All tasks are down , Worker exit")
-				alive = false
-			}
-		}
-	}
+
 }
 
-func TaskDone(task *Task) {
-	args := task
-	reply := Task{}
-	fmt.Println("MarkDone()")
-	ok := call("Coordinator.MarkDone", args, &reply)
-	if ok {
-		fmt.Println("Task Done!")
-	}
-}
-
-func GetTask() Task {
-	args := TaskArgs{}
-	reply := Task{}
-	// fmt.Println("gettask()")
-	if ok := call("Coordinator.PullTask", &args, &reply); ok {
-		fmt.Printf("reply TaskId is %d\n", reply.TaskId)
-	} else {
-		fmt.Printf("call failed!\n")
-	}
-	return reply
-}
-
-func DoMapTask(task *Task, mapf func(string, string) []KeyValue) {
-	intermediate := []KeyValue{}
-	fmt.Println(task.FileName)
-	file, err := os.Open(task.FileName[0])
+func performMap(mapFile string, taskNum int, nReduceTasks int, mapf func(string, string) []KeyValue) {
+	var intermediate = []KeyValue{}
+	fmt.Println(mapFile)
+	file, err := os.Open(mapFile)
 	if err != nil {
-		log.Fatalf("cannot open %v", task.FileName)
+		log.Fatalf("cannot open %v", mapFile)
 	}
-	content, err := io.ReadAll((file))
+	content, err := io.ReadAll(file)
 	if err != nil {
-		log.Fatalf("cannot read %v", task.FileName)
+		log.Fatalf("cannot read %v", mapFile)
 	}
 	file.Close()
-	reduceNum := task.ReduceNum
-	intermediate = mapf(task.FileName[0], string(content))
-	HashKv := make([][]KeyValue, reduceNum)
+	kva := mapf(mapFile, string(content))
+	intermediate = append(intermediate, kva...)
+	Hashkv := make([][]KeyValue, nReduceTasks)
 	for _, v := range intermediate {
-		index := ihash(v.Key) % reduceNum
-		HashKv[index] = append(HashKv[index], v)
+		index := ihash(v.Key) % nReduceTasks
+		Hashkv[index] = append(Hashkv[index], v)
 	}
 	path, _ := os.Getwd()
-	for i := 0; i < reduceNum; i++ {
+	for i := 0; i < nReduceTasks; i++ {
 		os.Mkdir("./mr-tmp-"+strconv.Itoa(i), 0666)
 		os.Chmod("./mr-tmp-"+strconv.Itoa(i), 0777)
 	}
 
-	for i := 0; i < reduceNum; i++ {
-
-		filename := path + "/mr-tmp-" + strconv.Itoa(i) + "/mr-tmp-" + strconv.Itoa(task.TaskId) + "-" + strconv.Itoa(i)
+	for i := 0; i < nReduceTasks; i++ {
+		filename := path + "/mr-tmp-" + strconv.Itoa(i) + "/mr-tmp-" + strconv.Itoa(taskNum) + "-" + strconv.Itoa(i)
 		new_file, err := os.Create(filename)
 		if err != nil {
 			log.Fatal("create file failed:", err)
 		}
+
 		enc := json.NewEncoder(new_file)
-		for _, kv := range HashKv[i] {
+		for _, kv := range Hashkv[i] {
 			err := enc.Encode(kv)
 			if err != nil {
 				log.Fatal("encode failed:", err)
@@ -135,17 +131,15 @@ func DoMapTask(task *Task, mapf func(string, string) []KeyValue) {
 	}
 }
 
-func DoReduceTask(task *Task, reducef func(string, []string) string) {
-	reduceNum := task.TaskId
+func performReduce(taskNum int, nMapTasks int, reducef func(string, []string) string) {
 
-	intermediate := shuffle(task.FileName)
+	intermediate := shuffle(GetReduceTasks(taskNum))
 
-	finalName := fmt.Sprintf("mr-out-%d", reduceNum)
-	ofile, err := os.Create(finalName)
-	if err != nil {
-		log.Fatal("create file failed:", err)
-	}
-	for i := 0; i < len(intermediate); {
+	finalName := fmt.Sprintf("mr-out-%d", taskNum)
+	ofile, _ := os.Create(finalName)
+
+	i := 0
+	for i < len(intermediate) {
 		j := i + 1
 		for j < len(intermediate) && intermediate[j].Key == intermediate[i].Key {
 			j++
@@ -155,7 +149,10 @@ func DoReduceTask(task *Task, reducef func(string, []string) string) {
 			values = append(values, intermediate[k].Value)
 		}
 		output := reducef(intermediate[i].Key, values)
+
+		// this is the correct format for each line of Reduce output.
 		fmt.Fprintf(ofile, "%v %v\n", intermediate[i].Key, output)
+
 		i = j
 	}
 	ofile.Close()
@@ -186,36 +183,50 @@ func shuffle(files []string) []KeyValue {
 	return kva
 }
 
+func GetReduceTasks(id int) []string {
+	s := []string{}
+	path, _ := os.Getwd()
+
+	files, _ := os.ReadDir(path + "/mr-tmp-" + strconv.Itoa(id))
+	for _, f := range files {
+		finame := f.Name()
+		finame = "mr-tmp-" + strconv.Itoa(id) + "/" + finame
+		// fmt.Println(finame)
+		s = append(s, finame)
+	}
+	return s
+}
+
 // example function to show how to make an RPC call to the coordinator.
 //
 // the RPC argument and reply types are defined in rpc.go.
-func CallExample() {
+// func CallExample() {
 
-	// declare an argument structure.
-	args := ExampleArgs{}
+// 	// declare an argument structure.
+// 	args := ExampleArgs{}
 
-	// fill in the argument(s).
-	args.X = 99
+// 	// fill in the argument(s).
+// 	args.X = 99
 
-	// declare a reply structure.
-	reply := ExampleReply{}
+// 	// declare a reply structure.
+// 	reply := ExampleReply{}
 
-	// send the RPC request, wait for the reply.
-	// the "Coordinator.Example" tells the
-	// receiving server that we'd like to call
-	// the Example() method of struct Coordinator.
-	ok := call("Coordinator.Example", &args, &reply)
-	if ok {
-		// reply.Y should be 100.
-		fmt.Printf("reply.Y %v\n", reply.Y)
-	} else {
-		fmt.Printf("call failed!\n")
-	}
-}
-
+// 	// send the RPC request, wait for the reply.
+// 	// the "Coordinator.Example" tells the
+// 	// receiving server that we'd like to call
+// 	// the Example() method of struct Coordinator.
+// 	ok := call("Coordinator.Example", &args, &reply)
+// 	if ok {
+// 		// reply.Y should be 100.
+// 		fmt.Printf("reply.Y %v\n", reply.Y)
+// 	} else {
+// 		fmt.Printf("call failed!\n")
+// 	}
+// }
 // send an RPC request to the coordinator, wait for the response.
 // usually returns true.
 // returns false if something goes wrong.
+
 func call(rpcname string, args interface{}, reply interface{}) bool {
 	// c, err := rpc.DialHTTP("tcp", "127.0.0.1"+":1234")
 	sockname := coordinatorSock()

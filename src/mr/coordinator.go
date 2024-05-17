@@ -4,140 +4,259 @@ import (
 	"fmt"
 	"log"
 	"net"
+	"os"
+	"sync"
+
 	"net/http"
 	"net/rpc"
-	"os"
-	"strconv"
-	"sync"
 )
 
-type Task struct {
-	TaskType  int
-	FileName  []string //
-	TaskId    int
-	ReduceNum int
-}
+// type Coordinator struct {
+// 	// Your definitions here.
 
-type TaskMetaInfo struct {
-	TaskAddr *Task
-	State    int
-}
+// 	//protect coordinator state
+// 	//from concurrent access
+// 	mu sync.Mutex
 
-type TaskMetaHolder struct {
-	MetaMap       map[int]*TaskMetaInfo
-	MapMetaMap    map[int]*TaskMetaInfo
-	ReduceMetaMap map[int]*TaskMetaInfo
-}
+// 	//Allow coordinator to wait to assign reduce tasks until map tasks have finished
+// 	//ro when all tasks are assigned and are running
+// 	//The coordinator is woken up either when a task has finished , or if a timeout has expired
+// 	cond *sync.Cond
 
-// tasktype
-const (
-	WaitingTask = iota
-	MapTask
-	ReduceTask
-	ExitTask
-)
+// 	//len(mapFiles) == nMap
+// 	mapFiles     []string
+// 	nMapTasks    int
+// 	nReduceTasks int
 
-// TaskMetaInfo state
-const (
-	Working = iota
-	Done
-)
+// 	//keep track of when tasks are assigned
+// 	//which tasks have finished
+// 	mapTasksFinished    []bool
+// 	mapTasksIssued      []time.Time
+// 	reduceTasksFinished []bool
+// 	reduceTasksIssued   []time.Time
 
-// Coordinator info
-const (
-	Mapstate = iota
-	Reducestate
-	AllDone
-)
-
-var mu sync.Mutex
+// 	//set to true if all reduce tasks are complete
+// 	isDone bool
+// }
 
 type Coordinator struct {
 	// Your definitions here.
-	State            int
-	MapChan          chan *Task
-	ReduceChan       chan *Task
-	ReduceNum        int
-	Files            []string
-	MrtaskMetaHolder TaskMetaHolder
+
 }
 
 // Your code here -- RPC handlers for the worker to call.
 
-func (c *Coordinator) PullTask(args *TaskArgs, reply *Task) error {
-	select {
-	case re := <-c.MapChan:
-		{
-			*reply = *re
-		}
-	case re := <-c.ReduceChan:
-		{
-			*reply = *re
-		}
-	default:
-		{
-			reply1 := &Task{
-				TaskType: WaitingTask,
-				TaskId:   -1,
-			}
-			reply2 := &Task{
-				TaskType: ExitTask,
-				TaskId:   -1,
-			}
-			if c.State == Mapstate {
-				*reply = *reply1
-			}
-			if c.State == Reducestate {
-				*reply = *reply2
-			}
+// handle GetTask RPCs from worker
+// func (c *Coordinator) HandleGetTask(args *GetTaskArgs, reply *GetTaskReply) error {
+// 	c.mu.Lock()
+// 	defer c.mu.Unlock()
 
+// 	reply.NReduceTasks = c.nReduceTasks
+// 	reply.NMapTasks = c.nMapTasks
+
+// 	for {
+// 		var mapDone = true
+// 		for m, done := range c.mapTasksFinished {
+// 			if !done {
+// 				//Assign a task if it's either never been issued, or if it's been too long
+// 				//since it was issued so the worker may have crashed
+// 				//Note: if task has never been issued, time is initialized to 0 UTC
+// 				if c.mapTasksIssued[m].IsZero() || time.Since(c.mapTasksIssued[m]).Seconds() > 10 {
+// 					reply.TaskType = Map
+// 					reply.TaskNum = m
+// 					reply.MapFile = c.mapFiles[m]
+// 					c.mapTasksIssued[m] = time.Now()
+// 					return nil
+// 				} else {
+// 					mapDone = false
+// 				}
+// 			}
+// 		}
+
+// 		if !mapDone {
+// 			//TODO wait
+// 			c.cond.Wait()
+// 		} else {
+// 			//all map tasks done
+// 			break
+// 		}
+// 	}
+
+// 	//reduce task state
+// 	for {
+// 		var reduceDone = true
+// 		for r, done := range c.reduceTasksFinished {
+// 			if !done {
+// 				if c.reduceTasksIssued[r].IsZero() || time.Since(c.reduceTasksIssued[r]).Seconds() > 10 {
+// 					reply.TaskType = Reduce
+// 					reply.TaskNum = r
+// 					c.reduceTasksIssued[r] = time.Now()
+// 					return nil
+// 				} else {
+// 					reduceDone = false
+// 				}
+// 			}
+
+// 		}
+// 		// fmt.Println(c.reduceTasksFinished)
+// 		if !reduceDone {
+// 			c.cond.Wait()
+// 		} else {
+// 			break
+// 		}
+
+// 	}
+
+// 	reply.TaskType = Done
+// 	c.isDone = true
+// 	return nil
+// }
+
+// func (c *Coordinator) HandleFinishedTask(args *FinishedTaskArgs, reply *FinishedTaskReply) error {
+// 	c.mu.Lock()
+// 	defer c.mu.Unlock()
+// 	switch args.Tasktype {
+// 	case Map:
+// 		c.mapTasksFinished[args.TaskNum] = true
+// 	case Reduce:
+// 		c.reduceTasksFinished[args.TaskNum] = true
+// 	default:
+// 		log.Fatal("Bad finished task? %s", args.Tasktype)
+// 	}
+// 	c.cond.Broadcast()
+
+// 	return nil
+// }
+
+var mu sync.Mutex
+var mapFiles []string
+var nMapTasks int
+var nReduceTasks int
+var waitWorkers = make(chan int)
+
+var workerReplys []chan *GetTaskReply
+var workerFinisheds []chan *FinishedTaskArgs
+
+var numWokers int
+var repTask chan *GetTaskReply
+
+// set to true if all reduce tasks are complete
+var isDone bool
+
+func DoCoordinator(workers chan int, numTask int, call_worker func(worker int, task int) bool) {
+	tasks := make(chan int, numTask)
+	done := make(chan bool)
+	exit := make(chan struct{})
+
+	go func() {
+		for {
+			select {
+			case Worker := <-workers:
+				go issueWorkerTaskThread(Worker, done, tasks, call_worker)
+			case <-exit:
+				return
+			}
 		}
+	}()
+
+	for task := 0; task < numTask; task++ {
+		tasks <- task
+	}
+	for i := 0; i < numTask; i++ {
+		<-done
+	}
+
+	close(tasks)
+
+	exit <- struct{}{}
+}
+
+func issueWorkerTaskThread(
+	worker int,
+	done chan bool,
+	tasks chan int,
+	call_worker func(worker int, task int) bool) {
+	for task := range tasks {
+		if call_worker(worker, task) {
+			done <- true
+		} else {
+			tasks <- task
+		}
+	}
+}
+
+func IssueMapTask(worker int, task int) bool {
+	// fmt.Println("worker:", worker)
+	// fmt.Println(len(workerReplys))
+	reply := GetTaskReply{
+		TaskType:     Map,
+		TaskNum:      task,
+		MapFile:      mapFiles[task],
+		NReduceTasks: nReduceTasks,
+		NMapTasks:    nMapTasks,
+	}
+	workerReplys[worker] <- &reply
+
+	<-workerFinisheds[worker]
+	return true
+}
+
+func IssueRedTask(worker int, task int) bool {
+	reply := GetTaskReply{
+		TaskType:     Reduce,
+		TaskNum:      task,
+		NReduceTasks: nReduceTasks,
+		NMapTasks:    nMapTasks,
+	}
+	workerReplys[worker] <- &reply
+	// start := time.Now()
+
+	<-workerFinisheds[worker]
+	return true
+}
+
+func (c *Coordinator) HandleGetTask(args *GetTaskArgs, reply *GetTaskReply) error {
+	workerid := args.Workerid
+	replys := <-workerReplys[workerid]
+	reply.NMapTasks = replys.NMapTasks
+	reply.NReduceTasks = replys.NReduceTasks
+	switch replys.TaskType {
+	case Map:
+		reply.TaskType = Map
+		reply.TaskNum = replys.TaskNum
+		reply.MapFile = replys.MapFile
+	case Reduce:
+		reply.TaskType = Reduce
+		reply.TaskNum = replys.TaskNum
+	case Done:
+		reply.TaskType = Done
 	}
 	return nil
 }
 
-func (t *TaskMetaHolder) CheckAllTasks() bool {
-	UnDoneNum, DoneNum := 0, 0
-
-	for _, v := range t.MetaMap {
-		if v.State == Working {
-			UnDoneNum++
-		} else if v.State == Done {
-			DoneNum++
-		}
-	}
-	if UnDoneNum == 0 && DoneNum > 0 {
-		return true
-	}
-	return false
+func (c *Coordinator) HandleFinishedTask(args *FinishedTaskArgs, reply *FinishedTaskReply) error {
+	workerFinisheds[args.Workid] <- args
+	return nil
 }
 
-func (c *Coordinator) ToNextState() {
-	if c.State == Mapstate {
-		c.State = Reducestate
-		fmt.Println("state changed : Reducestate")
-		c.MakeReduceTasks()
-	} else if c.State == Reducestate {
-		c.State = AllDone
-		fmt.Println("state changed : Alldone")
-	}
-}
-
-func (c *Coordinator) MarkDone(args *Task, reply *Task) error {
+func (c *Coordinator) RegisterWorker(args *RegisterArgs, reply *RegisterReply) error {
 	mu.Lock()
-	defer mu.Unlock()
-	meta, ok := c.MrtaskMetaHolder.MetaMap[args.TaskId]
-	if ok && meta.State == Working {
-		meta.State = Done
-	}
+	i := numWokers
+	numWokers++
+	workerReplys = append(workerReplys, make(chan *GetTaskReply))
+	workerFinisheds = append(workerFinisheds, make(chan *FinishedTaskArgs))
+	mu.Unlock()
+	reply.Workerid = i
+	waitWorkers <- i
+	fmt.Println("register worker", i)
 	return nil
 }
 
-// an example RPC handler.
-//
-// the RPC argument and reply types are defined in rpc.go.
-func (c *Coordinator) Example(args *ExampleArgs, reply *ExampleReply) error {
-	reply.Y = args.X + 1
+func InWorker(i int, workers2Map chan int, workers2Red chan int) error {
+
+	workers2Map <- i
+	workers2Red <- i
+
 	return nil
 }
 
@@ -158,16 +277,7 @@ func (c *Coordinator) server() {
 // main/mrcoordinator.go calls Done() periodically to find out
 // if the entire job has finished.
 func (c *Coordinator) Done() bool {
-	ret := false
-	if c.State != AllDone {
-		if c.MrtaskMetaHolder.CheckAllTasks() {
-			c.ToNextState()
-		}
-	}
-
-	if c.State == AllDone {
-		ret = true
-	}
+	ret := isDone
 
 	// Your code here.
 
@@ -177,78 +287,33 @@ func (c *Coordinator) Done() bool {
 // create a Coordinator.
 // main/mrcoordinator.go calls this function.
 // nReduce is the number of reduce tasks to use.
+
 func MakeCoordinator(files []string, nReduce int) *Coordinator {
-	c := Coordinator{
-		State:      Mapstate,
-		MapChan:    make(chan *Task, len(files)),
-		ReduceChan: make(chan *Task, nReduce),
-		ReduceNum:  nReduce,
-		Files:      files,
-		MrtaskMetaHolder: TaskMetaHolder{
-			MetaMap:       make(map[int]*TaskMetaInfo),
-			MapMetaMap:    make(map[int]*TaskMetaInfo),
-			ReduceMetaMap: make(map[int]*TaskMetaInfo),
-		},
-	}
-	c.MakeMapTasks()
+	c := Coordinator{}
+	workers2Map := make(chan int)
+	workers2Red := make(chan int)
+	mapFiles = files
+	nMapTasks = len(files)
+	nReduceTasks = nReduce
 
+	go func() {
+		for waitWorker := range waitWorkers {
+			go InWorker(waitWorker, workers2Map, workers2Red)
+		}
+	}()
 	// Your code here.
-
+	go func() {
+		//do map tasks issue
+		DoCoordinator(workers2Map, len(files), IssueMapTask)
+		DoCoordinator(workers2Red, nReduce, IssueRedTask)
+		for i := 0; i < len(workerReplys); i++ {
+			workerReplys[i] <- &GetTaskReply{
+				TaskType: Done,
+			}
+		}
+		isDone = true
+	}()
+	fmt.Println("c.server")
 	c.server()
-
 	return &c
-}
-
-func (c *Coordinator) MakeMapTasks() {
-	for id, v := range c.Files {
-		task := Task{
-			TaskType:  MapTask,
-			FileName:  []string{v},
-			TaskId:    id,
-			ReduceNum: c.ReduceNum,
-		}
-		TaskMetaInfo := TaskMetaInfo{&task, Working}
-		c.MrtaskMetaHolder.MetaMap[id] = &TaskMetaInfo
-		c.MrtaskMetaHolder.MapMetaMap[id] = &TaskMetaInfo
-		fmt.Println(v, "write success!")
-	}
-	for _, m := range c.MrtaskMetaHolder.MapMetaMap {
-		maptask := m.TaskAddr
-		c.MapChan <- maptask
-	}
-}
-
-func (c *Coordinator) MakeReduceTasks() {
-	for id := 0; id < c.ReduceNum; id++ {
-		reduceid := id + len(c.Files)
-		task := Task{
-			TaskType:  ReduceTask,
-			FileName:  c.GetRedeceTasks(id),
-			TaskId:    reduceid,
-			ReduceNum: c.ReduceNum,
-		}
-
-		TaskMetaInfo := TaskMetaInfo{&task, Working}
-		c.MrtaskMetaHolder.MetaMap[reduceid] = &TaskMetaInfo
-		c.MrtaskMetaHolder.ReduceMetaMap[reduceid] = &TaskMetaInfo
-		fmt.Println(reduceid, "add Reducetask success!")
-	}
-	for _, m := range c.MrtaskMetaHolder.ReduceMetaMap {
-		reducetask := m.TaskAddr
-		c.ReduceChan <- reducetask
-	}
-}
-
-func (c *Coordinator) GetRedeceTasks(id int) []string {
-	s := []string{}
-	path, _ := os.Getwd()
-
-	files, _ := os.ReadDir(path + "/mr-tmp-" + strconv.Itoa(id))
-	for _, f := range files {
-		finame := f.Name()
-		finame = "mr-tmp-" + strconv.Itoa(id) + "/" + finame
-		// fmt.Println(finame)
-		s = append(s, finame)
-	}
-	return s
 }
