@@ -39,18 +39,9 @@ func (a ByKey) Less(i, j int) bool { return a[i].Key < a[j].Key }
 func Worker(mapf func(string, string) []KeyValue,
 	reducef func(string, []string) string) {
 
-	rargs := RegisterArgs{}
-	rreply := RegisterReply{}
-
-	ok := call("Coordinator.RegisterWorker", &rargs, &rreply)
-	if !ok {
-		log.Fatal("InWorker error!")
-	}
-	workerId := rreply.Workerid
-
 	// Your worker implementation here.
 	for {
-		args := GetTaskArgs{Workerid: workerId}
+		args := GetTaskArgs{}
 		reply := GetTaskReply{}
 
 		//this will wait until we get assigned a task
@@ -72,7 +63,6 @@ func Worker(mapf func(string, string) []KeyValue,
 		}
 
 		finArgs := &FinishedTaskArgs{
-			Workid:   workerId,
 			Tasktype: reply.TaskType,
 			TaskNum:  reply.TaskNum,
 		}

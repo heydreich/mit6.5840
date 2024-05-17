@@ -35,7 +35,6 @@ const (
 )
 
 type GetTaskArgs struct {
-	Workerid int
 }
 
 type GetTaskReply struct {
@@ -52,7 +51,6 @@ type GetTaskReply struct {
 }
 
 type FinishedTaskArgs struct {
-	Workid int
 	//type of task worker assigned
 	Tasktype TaskType
 	// which task is it ? taskid
@@ -61,11 +59,10 @@ type FinishedTaskArgs struct {
 
 type FinishedTaskReply struct{}
 
-type RegisterArgs struct{}
+// type RegisterArgs struct{}
 
-type RegisterReply struct {
-	Workerid int
-}
+// type RegisterReply struct {
+// }
 
 // Cook up a unique-ish UNIX-domain socket name
 // in /var/tmp, for the coordinator.
