@@ -7,6 +7,7 @@ type PutAppendArgs struct {
 	// You'll have to add definitions here.
 	// Field names must start with capital letters,
 	// otherwise RPC will break.
+	Token int64
 }
 
 type PutAppendReply struct {
@@ -20,4 +21,12 @@ type GetArgs struct {
 
 type GetReply struct {
 	Value string
+}
+
+type FinishArgs struct {
+	Token int64
+	// You'll have to add definitions here.
+}
+
+type FinishReply struct {
 }
