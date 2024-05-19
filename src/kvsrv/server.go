@@ -44,7 +44,7 @@ func (kv *KVServer) Put(args *PutAppendArgs, reply *PutAppendReply) {
 func (kv *KVServer) Append(args *PutAppendArgs, reply *PutAppendReply) {
 	// Your code here.
 	key := args.Key
-	value := args.Value
+	var value = args.Value
 	kv.mu.Lock()
 	defer kv.mu.Unlock()
 	oldValue := kv.kvMap[key]
