@@ -63,7 +63,7 @@ const (
 	ElectTimeOutBase = 500
 
 	ElectTimeOutCheckInterval = time.Duration(300) * time.Millisecond // 检查是否超时的间隔
-	CommitCheckTimeInterval   = time.Duration(100) * time.Millisecond // 检查是否可以commit的间隔
+	CommitCheckTimeInterval   = time.Duration(100) * time.Millisecond // 检查是否可以commit的间隔,,,,
 )
 
 type Raft struct {
